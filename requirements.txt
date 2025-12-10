@@ -1,0 +1,6 @@
+streamlit
+pandas
+altair
+numpy
+firebase-admin
+#gcc main.c -o gateway -lws2_32
