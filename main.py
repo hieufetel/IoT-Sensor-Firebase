@@ -3,19 +3,18 @@ import time
 import firebase_admin
 from firebase_admin import credentials
 from firebase_admin import firestore
+from datetime import datetime  # <--- [MỚI] Thêm thư viện xử lý thời gian
 
 # --- IMPORT YOUR CUSTOM PARSER ---
-# This imports the file data_parser.py that handles the string logic
 import data_parser
 
-# --- 1. SETUP FIRESTORE (Your existing code) ---
+# --- 1. SETUP FIRESTORE ---
 cred = credentials.Certificate("serviceAccountKey.json")
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 print("Status: Firestore Connected.")
 
-# --- 2. SETUP SERIAL (Hardware Connection) ---
-# IMPORTANT: Check Device Manager for your EFR32 port (e.g., COM5)
+# --- 2. SETUP SERIAL ---
 SERIAL_PORT = '/dev/ttyACM0' 
 BAUD_RATE = 115200   
 
@@ -34,29 +33,31 @@ def listen_to_sensor():
         try:
             # A. CHECK FOR DATA
             if ser.in_waiting > 0:
-                # 1. Read raw string from EFR32 (Hardware Layer)
-                # Example input: "temp: 35, humid: 60, time: 12345"
                 raw_line = ser.readline().decode('utf-8', errors='ignore').strip()
                 
                 if raw_line:
                     print(f"\n[Raw Input]: {raw_line}")
 
-                    # 2. Parse the data (Logic Layer)
-                    # We send the messy string to your parser file
+                    # 2. Parse data
                     clean_data = data_parser.parse_sensor_line(raw_line)
 
-                    # 3. Push to Firestore (Database Layer)
+                    # 3. Push to Firestore
                     if clean_data:
-                        # Add a Server Timestamp (Good for sorting later)
+                        # Vẫn giữ cái này để App dễ sort (sắp xếp)
                         clean_data['timestamp'] = firestore.SERVER_TIMESTAMP
                         
-                        # We use .add() to create a new document with a random ID
-                        # This creates a log history (Log_1, Log_2, Log_3...)
-                        db.collection(u'sensor_data').add(clean_data)
-
+                        # --- [MỚI] TẠO ID ĐẸP (CLEAN ID) ---
+                        # Tạo chuỗi ID ví dụ: "2023-12-14_15-30-05"
+                        custom_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
                         
-                        print(f" -> [Uploaded]: {clean_data}")
-                        time.sleep(5)  # Small delay to avoid spamming
+                        # Dùng .document(ID).set() thay vì .add()
+                        # Để ghi vào đúng cái ID ngày giờ mình vừa tạo
+                        db.collection(u'sensor_data').document(custom_id).set(clean_data)
+                        
+                        print(f" -> [Uploaded]: {clean_data} (ID: {custom_id})")
+                        
+                        # Delay 5s để không bị trùng giây (vì ID tính theo giây)
+                        time.sleep(1) 
                     else:
                         print(" -> [Warning]: Could not parse data.")
                         
