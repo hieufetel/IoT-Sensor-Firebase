@@ -1,236 +1,251 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-#include <unistd.h>  // UNIX standard function definitions
-#include <fcntl.h>   // File control definitions
-#include <errno.h>   // Error number definitions
-#include <termios.h> // POSIX terminal control definitions
+/***************************************************************************//**
+* @file
+* @brief main() function.
+*******************************************************************************
+* # License
+* <b>Copyright 2020 Silicon Laboratories Inc. www.silabs.com</b>
+*******************************************************************************
+*
+* SPDX-License-Identifier: Zlib
+*
+* The licensor of this software is Silicon Laboratories Inc.
+*
+* This software is provided 'as-is', without any express or implied
+* warranty. In no event will the authors be held liable for any damages
+* arising from the use of this software.
+*
+* Permission is granted to anyone to use this software for any purpose,
+* including commercial applications, and to alter it and redistribute it
+* freely, subject to the following restrictions:
+*
+* 1. The origin of this software must not be misrepresented; you must not
+* claim that you wrote the original software. If you use this software
+* in a product, an acknowledgment in the product documentation would be
+* appreciated but is not required.
+* 2. Altered source versions must be plainly marked as such, and must not be
+* misrepresented as being the original software.
+* 3. This notice may not be removed or altered from any source distribution.
+*
+******************************************************************************/
 
-int serial_fd; // File descriptor for Serial Port
+#include "sl_component_catalog.h"
+#include "sl_system_init.h"
+#include "app.h"
+#if defined(SL_CATALOG_POWER_MANAGER_PRESENT)
+#include "sl_power_manager.h"
+#endif // SL_CATALOG_POWER_MANAGER_PRESENT
+#if defined(SL_CATALOG_KERNEL_PRESENT)
+#include "sl_system_kernel.h"
+#else // SL_CATALOG_KERNEL_PRESENT
+#include "sl_system_process_action.h"
+#endif // SL_CATALOG_KERNEL_PRESENT
+#include "app_log.h"
+#include "sl_sleeptimer.h"
 
-// ======================================================
-// OPEN UART (Linux Version)
-// ======================================================
-void open_serial(const char* port)
+#include "em_chip.h"
+#include "em_cmu.h"
+#include "em_gpio.h"
+#include "em_usart.h"
+
+#include "sl_udelay.h"
+
+// Size of the buffer for received data
+#define BUFLEN 10
+
+#define BSP_TXPORT gpioPortA
+#define BSP_RXPORT gpioPortA
+#define BSP_TXPIN 5
+#define BSP_RXPIN 6
+#define BSP_ENABLE_PORT gpioPortD
+#define BSP_ENABLE_PIN 4
+
+//Define led
+#define BSP_GPIO_LEDS
+#define BSP_GPIO_LED0_PORT gpioPortD
+#define BSP_GPIO_LED0_PIN 2
+#define BSP_GPIO_LED1_PORT gpioPortD
+#define BSP_GPIO_LED1_PIN 3
+#define BSP_GPIO_PB0_PORT gpioPortB
+#define BSP_GPIO_PB0_PIN 0
+//DHT11
+#define DHT11_PORT gpioPortB
+#define DHT11_PIN 1
+//
+
+
+/**************************************************************************//**
+* @brief
+* GPIO initialization
+*****************************************************************************/
+void initGPIO(void)
 {
-    // Open the Port.
-    // O_RDWR: Read+Write
-    // O_NOCTTY: Do not make this port the controlling terminal
-    // O_NDELAY: Do not care about the state of DCD signal line
-    serial_fd = open(port, O_RDWR | O_NOCTTY | O_NDELAY);
+// Configure the USART TX pin to the board controller as an output
+GPIO_PinModeSet(BSP_TXPORT, BSP_TXPIN, gpioModePushPull, 1);
 
-    if (serial_fd == -1) {
-        printf("Error: Unable to open port %s\n", port);
-        perror("open_serial");
-        exit(1);
-    }
+// Configure the USART RX pin to the board controller as an input
+GPIO_PinModeSet(BSP_RXPORT, BSP_RXPIN, gpioModeInput, 0);
 
-    // Configure Port (Equivalent to DCB in Windows)
-    struct termios tty;
-    if (tcgetattr(serial_fd, &tty) != 0) {
-        printf("Error: tcgetattr failed\n");
-        exit(1);
-    }
+/*
+* Configure the BCC_ENABLE pin as output and set high. This enables
+* the virtual COM port (VCOM) connection to the board controller and
+* permits serial port traffic over the debug connection to the host
+* PC.
+*
+* To disable the VCOM connection and use the pins on the kit
+* expansion (EXP) header, comment out the following line.
+*/
+GPIO_PinModeSet(BSP_ENABLE_PORT, BSP_ENABLE_PIN, gpioModePushPull, 1);
+}
 
-    // Set Baud Rate to 115200
-    cfsetospeed(&tty, B115200);
-    cfsetispeed(&tty, B115200);
+void initLED_BUTTON(){
+// Enable GPIO clock
+CMU_ClockEnable(cmuClock_GPIO, true);
+// Configure PB0 and PB1 as input with glitch filter enabled
+GPIO_PinModeSet(BSP_GPIO_PB0_PORT, BSP_GPIO_PB0_PIN, gpioModeInputPullFilter, 1);
+GPIO_PinModeSet(DHT11_PORT, DHT11_PIN, gpioModeInputPullFilter, 1);
+// Configure LED0 and LED1 as output
+GPIO_PinModeSet(BSP_GPIO_LED0_PORT, BSP_GPIO_LED0_PIN, gpioModePushPull, 0);
+GPIO_PinModeSet(BSP_GPIO_LED1_PORT, BSP_GPIO_LED1_PIN, gpioModePushPull, 0);
+// Enable IRQ for even numbered GPIO pins
+NVIC_EnableIRQ(GPIO_EVEN_IRQn);
+// Enable IRQ for odd numbered GPIO pins
+NVIC_EnableIRQ(GPIO_ODD_IRQn);
+// Enable falling-edge interrupts for PB pins
+GPIO_ExtIntConfig(BSP_GPIO_PB0_PORT, BSP_GPIO_PB0_PIN,BSP_GPIO_PB0_PIN, 0, 1, true);
+GPIO_ExtIntConfig(DHT11_PORT, DHT11_PIN,DHT11_PIN, 0, 1, true);
+}
 
-    // 8N1 Configuration (8 Data bits, No Parity, 1 Stop bit)
-    tty.c_cflag &= ~PARENB;     // No Parity
-    tty.c_cflag &= ~CSTOPB;     // 1 Stop bit
-    tty.c_cflag &= ~CSIZE;      // Clear size bits
-    tty.c_cflag |= CS8;         // 8 bits per byte
+void GPIO_EVEN_IRQHandler(void)
+{
+// Clear all even pin interrupt flags
+GPIO_IntClear(0x5555);
+// Code here
 
-    // Disable Hardware Flow Control
-    tty.c_cflag &= ~CRTSCTS;
+}
 
-    // Enable Reading & Ignore Modem Control Lines
-    tty.c_cflag |= CREAD | CLOCAL;
+void GPIO_ODD_IRQHandler (void)
+{
+// Clear all odd pin interrupt flags
+GPIO_IntClear(0xAAAA);
+// Code here
 
-    // Disable Canonical Mode (Read raw bytes, not line by line)
-    // We handle line buffering manually in read_loop()
-    tty.c_lflag &= ~ICANON;
-    tty.c_lflag &= ~ECHO;       // Disable Echo
-    tty.c_lflag &= ~ECHOE;      // Disable Erasure
-    tty.c_lflag &= ~ISIG;       // Disable Signals
+}
 
-    // Disable Software Flow Control
-    tty.c_iflag &= ~(IXON | IXOFF | IXANY);
+// Khai báo extern cho hàm hiển thị LCD (giả định)
+extern void memlcd_app_init(uint8_t hum, uint8_t hum_decimal, uint8_t temp, uint8_t temp_decimal);
+extern uint8_t humidity, humidity_decimal, temperature, temperature_decimal;
+extern void get_temp_hum(uint8_t hum, uint8_t hum_decimal, uint8_t temp, uint8_t temp_decimal);
 
-    // Disable Special Output Processing
-    tty.c_oflag &= ~OPOST;
 
-    // Apply Settings
-    if (tcsetattr(serial_fd, TCSANOW, &tty) != 0) {
-        printf("Error: tcsetattr failed\n");
-        exit(1);
-    }
+// Định nghĩa hằng số và giá trị timeout
+#define MAX_TIMEOUT 100 // Timeout tối đa trong micro giây
+#define DHT11_PIN_HIGH_TIMEOUT 100 // Timeout cho trạng thái pin cao
 
-    // Flush buffer to remove old data
-    tcflush(serial_fd, TCIFLUSH);
-
-    printf(" [Linux] Serial Port Opened: %s\n", port);
+// Hàm chờ trạng thái pin với timeout
+bool wait_for_pin_state(GPIO_Port_TypeDef port, uint8_t pin, bool desiredState, uint32_t timeout) {
+uint32_t time = 0;
+while (GPIO_PinInGet(port, pin) != desiredState && time++ < timeout) {
+sl_udelay_wait(1); // Thời gian trễ nhỏ cho sự thay đổi trạng thái pin
+}
+return time < timeout;
 }
 
 
-// ======================================================
-// POST DATA TO FIREBASE (Same logic, system calls work in Linux)
-// ======================================================
-// ======================================================
-// POST DATA TO FIREBASE (FIXED)
-// ======================================================
-void http_post(float temperature, float humidity)
+// Hàm đọc dữ liệu từ DHT11
+bool DHT11_ReadData(void) {
+uint8_t data[5] = {0, 0, 0, 0, 0};
+uint32_t timeOut;
+
+// 1. Gửi tín hiệu khởi động
+GPIO_PinModeSet(DHT11_PORT, DHT11_PIN, gpioModePushPull, 0); // Set pin to low
+GPIO_PinOutClear(DHT11_PORT, DHT11_PIN);
+sl_udelay_wait(18000); // Delay 18ms (DHT11 requirement)
+GPIO_PinOutSet(DHT11_PORT, DHT11_PIN);
+sl_udelay_wait(20); // Delay 20-40µs
+GPIO_PinModeSet(DHT11_PORT, DHT11_PIN, gpioModeInputPull, 1); // Set pin to input mode
+
+// 2. Chờ phản hồi từ DHT11
+timeOut = 0;
+// Chờ pin về LOW (Start signal của DHT11)
+if (!wait_for_pin_state(DHT11_PORT, DHT11_PIN, 0, MAX_TIMEOUT)) return false;
+timeOut = 0;
+// Chờ pin lên HIGH (ACK response)
+if (!wait_for_pin_state(DHT11_PORT, DHT11_PIN, 1, MAX_TIMEOUT)) return false;
+timeOut = 0;
+// Chờ pin về LOW (ACK response kết thúc)
+if (!wait_for_pin_state(DHT11_PORT, DHT11_PIN, 0, MAX_TIMEOUT)) return false;
+
+
+// 3. Đọc dữ liệu 40-bit
+for (int i = 0; i < 40; i++)
 {
-    const char* url_history =
-        "https://anhbaolmao1-default-rtdb.asia-southeast1.firebasedatabase.app/sensor.json";
-    const char* url_current =
-        "https://anhbaolmao1-default-rtdb.asia-southeast1.firebasedatabase.app/current.json";
+// Chờ đầu xung (HIGH pulse bắt đầu)
+timeOut = 0;
+while (!GPIO_PinInGet(DHT11_PORT, DHT11_PIN) && timeOut++ < 100) sl_udelay_wait(1);
+if (timeOut >= 100) return false;
 
-    // --- 1. PREPARE DATA ---
-    time_t now = time(NULL);
-    struct tm* p = localtime(&now);
-    char timebuf[40];
-    strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", p);
+sl_udelay_wait(30); // Delay 30µs để xác định bit (HIGH pulse 26-28µs là '0', 70µs là '1')
 
-    FILE* f = fopen("data.json", "w");
-    if (!f) {
-        printf(" Error: Cannot create data.json\n");
-        return;
-    }
-    fprintf(f,
-        "{ \"temperature\": %.2f, \"humidity\": %.2f, \"time\": \"%s\" }",
-        temperature, humidity, timebuf);
-    fclose(f);
+if (GPIO_PinInGet(DHT11_PORT, DHT11_PIN)) // Nếu chân vẫn ở mức cao sau 30µs (là bit '1')
+data[i / 8] |= (1 << (7 - (i % 8)));
 
-    char cmd[600];
-
-    // --- 2. UPLOAD HISTORY (POST) ---
-    // Use POST to add a new row to the list
-    sprintf(cmd,
-        "curl -s -X POST -H \"Content-Type: application/json\" "
-        "-d @data.json \"%s\"",
-        url_history);
-    
-    printf("➡ Uploading History Node...\n");
-    system(cmd); // <--- EXECUTE HERE
-
-
-    // --- 3. UPDATE CURRENT STATUS (PUT) ---
-    // Use PUT to overwrite the specific location
-    sprintf(cmd,
-        "curl -s -X PUT -H \"Content-Type: application/json\" "
-        "-d @data.json \"%s\"",
-        url_current);
-
-    printf("➡ Updating Current Node...\n");
-    system(cmd); // <--- EXECUTE HERE AGAIN
-
-    printf(" Done.\n\n");
+// Chờ cuối xung (HIGH pulse kết thúc)
+timeOut = 0;
+while (GPIO_PinInGet(DHT11_PORT, DHT11_PIN) && timeOut++ < 100) sl_udelay_wait(1);
+if (timeOut >= 100) return false;
 }
 
 
-// ======================================================
-// PROCESS ONE LINE OF UART
-// ======================================================
-void process_line(const char* line)
-{
-    float t = 0, h = 0;
+// 4. Kiểm tra checksum
+if (data[4] != (data[0] + data[1] + data[2] + data[3]))
+return false;
 
-    // Format 1: "Nhiet do: 29.7 C, Do am: 62.0 %"
-    if (sscanf(line, "Nhiet do: %f C, Do am: %f %%", &t, &h) == 2)
-    {
-        printf(" Parsed OK  →  T=%.2f  H=%.2f\n", t, h);
-        http_post(t, h);
-        return;
-    }
 
-    // Format 2: "Temp:29.7,Humid:62.0"
-    if (sscanf(line, "Temp:%f,Humid:%f", &t, &h) == 2)
-    {
-        printf(" Parsed OK  →  T=%.2f  H=%.2f\n", t, h);
-        http_post(t, h);
-        return;
-    }
+// 5. Chuyển đổi dữ liệu
+humidity = data[0]; // Độ ẩm phần nguyên
+humidity_decimal = data[1]; // Độ ẩm phần thập phân
+temperature = data[2]; // Nhiệt độ phần nguyên
+temperature_decimal = data[3]; // Nhiệt độ phần thập phân
 
-    // Format 3: "temp: 35, humid: 60" (Based on your Python example)
-    if (sscanf(line, "temp: %f, humid: %f", &t, &h) == 2)
-    {
-        printf(" Parsed OK  →  T=%.2f  H=%.2f\n", t, h);
-        http_post(t, h);
-        return;
-    }
 
-    printf(" Unrecognized format: %s\n", line);
+return true; // Đọc dữ liệu thành công
 }
 
 
-// ======================================================
-// UART READER LOOP (Linux Version)
-// ======================================================
-void read_loop()
+
+int main(void)
 {
-    char byte;
-    char line[256];
-    int idx = 0;
-    int n;
+// Initialize Silicon Labs device, system, service(s) and protocol stack(s).
+// Note that if the kernel is present, processing task(s) will be created by
+// this call.
+sl_system_init();
 
-    printf("Listening to UART...\n\n");
+// Khởi tạo các ngoại vi (GPIO, LED, Button)
+initGPIO();
+initLED_BUTTON();
 
-    while (1)
-    {
-        // Read 1 byte from file descriptor
-        n = read(serial_fd, &byte, 1);
+// Initialize the application. For example, create periodic timer(s) or
+// task(s) if the kernel is present.
+app_init(); // Bắt đầu khởi tạo BLE và Timer
 
-        if (n > 0)
-        {
-            // Handle Newline (End of data packet)
-            if (byte == '\n' || byte == '\r')
-            {
-                if (idx > 0)
-                {
-                    line[idx] = '\0'; // Null-terminate string
-                    printf("[UART] %s\n", line);
+while (1){
+  // 1. Đọc dữ liệu từ cảm biến DHT11 và cập nhật các biến toàn cục (humidity, temperature, ...)
+  if(DHT11_ReadData()){
+      // Log để xác nhận đọc thành công
+      app_log("temp: %d.%d, humid: %d.%d, time: 1\r\n", temperature, temperature_decimal, humidity, humidity_decimal);
 
-                    process_line(line);
-                    idx = 0; // Reset buffer
-                }
-            }
-            else
-            {
-                // Add byte to buffer if space exists
-                if (idx < sizeof(line) - 1)
-                    line[idx++] = byte;
-            }
-        }
-        else if (n < 0) {
-            // Check for errors, ignore "Resource temporarily unavailable"
-            if (errno != EAGAIN) {
-                perror("Read error");
-            }
-        }
-    }
+      // GỌI HÀM HIỂN THỊ LÊN LCD <--- ĐÃ KHÔI PHỤC VÀ ĐẶT ĐÚNG VỊ TRÍ
+      memlcd_app_init(humidity, humidity_decimal, temperature, temperature_decimal);
+
+      // GỌI HÀM CẬP NHẬT DỮ LIỆU SANG APP.C DÙNG CHO QUẢNG BÁ
+      get_temp_hum(humidity, humidity_decimal, temperature, temperature_decimal);
+  } else {
+  }
+
+  // 2. Xử lý các tác vụ của hệ thống (bao gồm cả việc kiểm tra timer và cập nhật quảng bá)
+  sl_system_process_action();
+
+  // 3. Trễ trước lần đọc cảm biến tiếp theo
+  sl_sleeptimer_delay_millisecond(1000);
 }
-
-
-// ======================================================
-// MAIN
-// ======================================================
-int main()
-{
-    // On Linux, EFR32/Arduino usually appears as /dev/ttyACM0
-    // If not, check: ls /dev/tty*
-    const char* port_name = "/dev/ttyACM0";
-
-    open_serial(port_name);
-
-    printf("\n=== TOOL SEND SENSOR TO FIREBASE (LINUX) ===\n");
-    printf("Firebase path: /sensor.json\n");
-    printf("Port: %s\n\n", port_name);
-
-    read_loop();
-
-    close(serial_fd);
-    return 0;
 }
